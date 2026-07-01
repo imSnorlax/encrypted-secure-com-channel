@@ -33,21 +33,24 @@ IDENTITY_DIR   = Path.home() / ".channel"
 
 
 class C:
-    RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
-    GREEN = "\033[92m"; CYAN = "\033[96m"; YELLOW = "\033[93m"
-    RED   = "\033[91m"; BLUE = "\033[94m"; GREY  = "\033[90m"
+    RESET   = "\033[0m";  BOLD    = "\033[1m";  DIM    = "\033[2m"
+    GREEN   = "\033[92m"; CYAN    = "\033[96m"; YELLOW = "\033[93m"
+    RED     = "\033[91m"; BLUE    = "\033[94m"; GREY   = "\033[90m"
+    MAGENTA = "\033[95m"; WHITE   = "\033[97m"; BG_DARK = "\033[40m"
 
 
 def _banner() -> None:
     print(f"""
-{C.CYAN}{C.BOLD}\
-  ██████╗██╗  ██╗ █████╗ ███╗   ██╗███╗   ██╗███████╗██╗
- ██╔════╝██║  ██║██╔══██╗████╗  ██║████╗  ██║██╔════╝██║
- ██║     ███████║███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
- ██║     ██╔══██║██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
- ╚██████╗██║  ██║██║  ██║██║ ╚████║██║ ╚████║███████╗███████╗
-  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
-{C.RESET}{C.DIM}  Signal-style E2E encryption  ·  X3DH + Double Ratchet{C.RESET}
+{C.CYAN}{C.BOLD}  ███████╗███╗   ██╗ ██████╗ ██████╗ ██╗     ██╗  ██╗██╗  ██╗██╗
+  ██╔════╝████╗  ██║██╔═████╗██╔══██╗██║     ██║  ██║╚██╗██╔╝██║
+  ███████╗██╔██╗ ██║██║██╔██║██████╔╝██║     ███████║ ╚███╔╝ ██║
+  ╚════██║██║╚██╗██║████╔╝██║██╔══██╗██║     ╚════██║ ██╔██╗ ╚═╝
+  ███████║██║ ╚████║╚██████╔╝██║  ██║███████╗     ██║██╔╝ ██╗██╗
+  ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝     ╚═╝╚═╝  ╚═╝╚═╝{C.RESET}
+{C.GREY}  ┌─────────────────────────────────────────────────────────┐
+  │  {C.CYAN}Protocol{C.GREY}  X3DH + Double Ratchet   {C.CYAN}Cipher{C.GREY}  AES-256-GCM  │
+  │  {C.CYAN}Keys{C.GREY}     X25519 · Ed25519        {C.CYAN}KDF{C.GREY}    HKDF-SHA256  │
+  └─────────────────────────────────────────────────────────┘{C.RESET}
 """)
 
 
@@ -77,8 +80,9 @@ def _die(msg: str) -> None:
     click.echo(f"{C.RED}✗ {msg}{C.RESET}", err=True)
     raise SystemExit(1)
 
-def _ok(msg: str)   -> None: click.echo(f"{C.GREEN}✓{C.RESET} {msg}")
-def _info(msg: str) -> None: click.echo(f"{C.CYAN}·{C.RESET} {msg}")
+def _ok(msg: str)   -> None: click.echo(f"  {C.GREEN}✓{C.RESET}  {msg}")
+def _info(msg: str) -> None: click.echo(f"  {C.CYAN}»{C.RESET}  {msg}")
+def _warn(msg: str) -> None: click.echo(f"  {C.YELLOW}!{C.RESET}  {msg}")
 
 
 # ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -190,11 +194,11 @@ def register(ctx, username, opks):
     if path.exists():
         if not click.confirm(f"{C.YELLOW}Overwrite existing identity for '{username}'?{C.RESET}"):
             return
-    _info(f"Generating identity for {C.BOLD}{username}{C.RESET} …")
+    _info(f"Generating identity for {C.BOLD}{C.CYAN}{username}{C.RESET} …")
     identity = LocalIdentity.generate(username, num_opks=opks)
     identity.save(path)
-    _ok(f"Identity saved → {path}")
-    _info("Connecting to relay …")
+    _ok(f"Identity saved  {C.DIM}{path}{C.RESET}")
+    _info(f"Uploading key bundle to relay …")
     asyncio.run(_do_register(ctx.obj["server"], identity))
 
 
@@ -202,8 +206,9 @@ async def _do_register(server, identity):
     async with Transport(server) as t:
         resp = await t.rpc({"type": "register", "bundle": identity.public_bundle()})
     if resp["type"] == "ok":
-        _ok(resp["msg"])
-        _ok(f"Uploaded {len(identity.opks)} one-time prekeys")
+        _ok(f"Registered as {C.BOLD}{C.CYAN}{identity.username}{C.RESET}")
+        _ok(f"Uploaded {C.BOLD}{len(identity.opks)}{C.RESET} one-time prekeys  {C.DIM}(forward secrecy){C.RESET}")
+        _divider()
     else:
         _die(f"Registration failed: {resp.get('msg')}")
 
@@ -213,10 +218,12 @@ async def _do_register(server, identity):
 def whoami(ctx):
     """Show identity info."""
     i = _load_identity(ctx.obj["user"])
-    click.echo(f"Username  : {C.BOLD}{i.username}{C.RESET}")
-    click.echo(f"IK pub    : {C.DIM}{pub_to_b64(i.ik_pub)[:32]}…{C.RESET}")
-    click.echo(f"Sign pub  : {C.DIM}{pub_to_b64(i.ik_sign_pub)[:32]}…{C.RESET}")
-    click.echo(f"OPKs left : {len(i.opks)}")
+    _divider()
+    click.echo(f"  {C.BOLD}Username {C.RESET}  {C.CYAN}{i.username}{C.RESET}")
+    click.echo(f"  {C.BOLD}IK pub   {C.RESET}  {C.DIM}{pub_to_b64(i.ik_pub)[:40]}…{C.RESET}")
+    click.echo(f"  {C.BOLD}Sign pub {C.RESET}  {C.DIM}{pub_to_b64(i.ik_sign_pub)[:40]}…{C.RESET}")
+    click.echo(f"  {C.BOLD}OPKs     {C.RESET}  {len(i.opks)} remaining")
+    _divider()
 
 
 @cli.command()
@@ -288,7 +295,13 @@ def chat(ctx, peer):
     """Open interactive chat with PEER."""
     identity = _load_identity(ctx.obj["user"])
     _banner()
-    click.echo(f"  {C.BOLD}Chatting with {C.GREEN}{peer}{C.RESET}  {C.DIM}(/quit to exit){C.RESET}\n")
+    click.echo(
+        f"  {C.GREY}┌──────────────────────────────────────────┐{C.RESET}\n"
+        f"  {C.GREY}│{C.RESET}  Chatting with {C.GREEN}{C.BOLD}{peer}{C.RESET}          "
+        f"{C.DIM}/quit to exit{C.RESET}  {C.GREY}│{C.RESET}\n"
+        f"  {C.GREY}│{C.RESET}  {C.DIM}End-to-end encrypted · relay sees nothing{C.RESET}  {C.GREY}│{C.RESET}\n"
+        f"  {C.GREY}└──────────────────────────────────────────┘{C.RESET}\n"
+    )
     asyncio.run(_do_chat(ctx.obj["server"], identity, peer))
 
 
