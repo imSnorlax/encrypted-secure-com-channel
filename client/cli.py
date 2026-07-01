@@ -200,7 +200,12 @@ def _process_envelope(
     hdr       = payload["header"]
     ct_b64    = payload["ciphertext"]
 
-    if x3dh_hdr and not store.has_session(sender):
+    if x3dh_hdr:
+        # Sender initiated X3DH — ALWAYS establish from their header.
+        # This overrides any session we pre-established locally, because
+        # both sides calling _ensure_session_sender at chat startup would
+        # produce two different session keys (different ephemeral keys).
+        # The incoming X3DH header is the authoritative source of truth.
         try:
             state = _establish_receiver_session(local, store, sender, x3dh_hdr)
         except Exception as exc:
