@@ -29,10 +29,21 @@ Server → Client:
 """
 
 import asyncio
+import base64
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+
+def _try_decode(ct_b64: str) -> str:
+    """Relay's best attempt to read a message. Always fails."""
+    try:
+        raw = base64.b64decode(ct_b64)
+        text = raw.decode("utf-8")   # will raise — it's encrypted bytes
+        return repr(text[:40])
+    except Exception:
+        return "<binary garbage — AES-256-GCM ciphertext>"
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -152,6 +163,18 @@ class RelayServer:
         if not to or payload is None:
             await self._send(ws, {"type": "error", "msg": "missing to/payload"})
             return
+
+        # ── SPY MODE: relay tries to read the message ─────────────────────────
+        ciphertext = payload.get("ciphertext", "")
+        print("\n" + "─" * 60)
+        print(f"  🕵️  RELAY SPY ATTEMPT  ({sender} → {to})")
+        print(f"  Raw ciphertext  : {ciphertext[:55]}…")
+        print(f"  Decode attempt  : {_try_decode(ciphertext)}")
+        print(f"  DR header       : n={payload.get('header', {}).get('n')}  "
+              f"dh_pub={payload.get('header', {}).get('dh_pub', '')[:16]}…")
+        print(f"  VERDICT         : ✗ CANNOT READ — AES-256-GCM encrypted")
+        print("─" * 60 + "\n")
+        # ── End spy mode ──────────────────────────────────────────────────────
 
         envelope = {
             "from": sender,
