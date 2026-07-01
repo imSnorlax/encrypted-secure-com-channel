@@ -83,6 +83,8 @@ def _die(msg: str) -> None:
 def _ok(msg: str)   -> None: click.echo(f"  {C.GREEN}✓{C.RESET}  {msg}")
 def _info(msg: str) -> None: click.echo(f"  {C.CYAN}»{C.RESET}  {msg}")
 def _warn(msg: str) -> None: click.echo(f"  {C.YELLOW}!{C.RESET}  {msg}")
+def _divider()      -> None: click.echo(f"  {C.GREY}{'─' * 55}{C.RESET}")
+
 
 
 # ─── Crypto helpers ───────────────────────────────────────────────────────────
