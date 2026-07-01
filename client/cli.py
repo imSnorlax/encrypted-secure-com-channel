@@ -16,7 +16,6 @@ Sessions are stored at ~/.channel/<username>/store.db
 
 import asyncio
 import base64
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,14 +23,12 @@ from typing import Optional
 
 import click
 
-# ── path setup (allow running as script or installed package) ────────────────
+# ── path setup ───────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from client.crypto.keys import LocalIdentity, b64_to_pub_x25519, pub_to_b64
 from client.crypto.x3dh import x3dh_send, x3dh_receive
-from client.crypto.double_ratchet import (
-    RatchetState, encrypt_message, decrypt_message,
-)
+from client.crypto.double_ratchet import RatchetState, encrypt_message, decrypt_message
 from client.store import SessionStore
 from client.transport import Transport
 
@@ -54,7 +51,6 @@ class C:
     RED     = "\033[91m"
     BLUE    = "\033[94m"
     GREY    = "\033[90m"
-    MAGENTA = "\033[95m"
 
 
 def _banner() -> None:
@@ -99,7 +95,7 @@ def _load_identity(username: Optional[str] = None) -> LocalIdentity:
 
 def _die(msg: str) -> None:
     click.echo(f"{C.RED}✗ {msg}{C.RESET}", err=True)
-    sys.exit(1)
+    raise SystemExit(1)
 
 
 def _ok(msg: str) -> None:
@@ -134,28 +130,23 @@ async def _ensure_session_sender(
     peer: str,
 ) -> RatchetState:
     """
-    Load existing ratchet session for `peer`, or perform X3DH to create one.
-    Attaches `_x3dh_header` attribute if this is a brand-new session.
+    Return existing ratchet session for peer, or perform X3DH to create one.
+    IMPORTANT: calls transport.rpc() if no session exists — must be called
+    before any background recv() tasks are running.
     """
     state = store.load_session(peer)
     if state:
         return state
 
-    # Fetch peer's bundle from relay
     resp = await transport.rpc({"type": "get_bundle", "username": peer})
     if resp["type"] == "error":
         _die(f"Could not get bundle for '{peer}': {resp['msg']}")
 
     bundle = resp["bundle"]
-
-    # X3DH → shared secret + header Alice must attach to first message
     sk, x3dh_header = x3dh_send(local, bundle)
 
-    # Initialise sender-side Double Ratchet using Bob's SPK as the first remote key
     remote_spk_pub = b64_to_pub_x25519(bundle["spk_pub"])
     state = RatchetState.init_sender(sk, remote_spk_pub)
-
-    # Tag the new state so the caller knows to attach the X3DH header
     state._x3dh_header = x3dh_header  # type: ignore[attr-defined]
 
     store.save_session(peer, state, is_initiator=True)
@@ -168,13 +159,10 @@ def _establish_receiver_session(
     sender: str,
     x3dh_header: dict,
 ) -> RatchetState:
-    """
-    Synchronous X3DH responder path — safe to call inside or outside a loop.
-    Derives shared secret, initialises Bob's ratchet, persists state.
-    """
+    """Synchronous X3DH responder — safe everywhere."""
     sk, used_opk = x3dh_receive(local, x3dh_header)
     if used_opk is not None:
-        local.save(_identity_path(local.username))   # persist OPK consumption
+        local.save(_identity_path(local.username))
     state = RatchetState.init_receiver(sk, local.spk_priv, local.spk_pub)
     store.save_session(sender, state, is_initiator=False)
     return state
@@ -207,16 +195,11 @@ def _process_envelope(
     payload: dict,
     ts: str,
 ) -> None:
-    """
-    Decrypt and print one incoming message envelope.
-    Handles X3DH initiation transparently.
-    Pure synchronous — safe to call from anywhere.
-    """
+    """Decrypt and print one incoming message. Fully synchronous."""
     x3dh_hdr = payload.get("x3dh_header")
     hdr       = payload["header"]
     ct_b64    = payload["ciphertext"]
 
-    # First message ever from this sender?
     if x3dh_hdr and not store.has_session(sender):
         try:
             state = _establish_receiver_session(local, store, sender, x3dh_hdr)
@@ -226,10 +209,7 @@ def _process_envelope(
     else:
         state = store.load_session(sender)
         if state is None:
-            click.echo(
-                f"{C.RED}✗ No session with {sender}. "
-                f"Dropping message (X3DH header missing?).{C.RESET}"
-            )
+            click.echo(f"{C.RED}✗ No session with {sender}. Dropping.{C.RESET}")
             return
 
     try:
@@ -247,7 +227,10 @@ def _process_envelope(
     "--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER",
     show_default=True, help="Relay server WebSocket URL",
 )
-@click.option("--user", default=None, envvar="CHANNEL_USER", help="Username (auto-detected if only one exists, or set CHANNEL_USER)")
+@click.option(
+    "--user", default=None, envvar="CHANNEL_USER",
+    help="Username (auto-detected if only one exists, or set CHANNEL_USER)",
+)
 @click.pass_context
 def cli(ctx, server: str, user: Optional[str]) -> None:
     """Channel — end-to-end encrypted CLI messenger."""
@@ -316,7 +299,6 @@ def sessions(ctx) -> None:
     store    = SessionStore(identity.username)
     peers    = store.list_sessions()
     store.close()
-
     if not peers:
         click.echo(f"{C.DIM}No open sessions.{C.RESET}")
     else:
@@ -359,8 +341,9 @@ async def _do_send(
         resp = await t.rpc({"type": "send", "to": peer, "payload": payload})
         store.close()
 
+    status = "delivered" if resp.get("msg") == "delivered" else "queued"
     if resp["type"] == "ok":
-        _ok(f"Message {'delivered' if resp['msg'] == 'delivered' else 'queued'} → {peer}")
+        _ok(f"Message {status} → {peer}")
     else:
         _die(f"Send failed: {resp}")
 
@@ -413,21 +396,24 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
     """
     Interactive full-duplex chat.
 
-    Uses a single dispatcher task as the ONLY coroutine calling recv().
-    All frames are routed via asyncio.Queue to avoid concurrent recv() calls,
-    which the websockets library forbids.
-
-      ack_q   ← server replies to our sends (ok / queued)
-      inbox_q ← pushed 'deliver' messages from other users
+    Architecture:
+      - ONE dispatcher task owns all recv() calls (websockets forbids concurrent recv)
+      - All frames routed via asyncio.Queue:
+          ack_q   → server acks for our outgoing sends
+          inbox_q → incoming 'deliver' frames from peer
+      - Session pre-established BEFORE dispatcher starts, so no recv()
+        call is ever made inside the send loop.
     """
     async with Transport(server) as t:
+
+        # ── Phase 1: sequential setup (no background tasks yet) ──────────────
         resp = await t.rpc({"type": "register", "bundle": local.public_bundle()})
         if resp["type"] != "ok":
             _die("Server auth failed")
 
         store = SessionStore(local.username)
 
-        # Drain any queued messages first (safe: no tasks running yet)
+        # Flush any offline messages
         resp = await t.rpc({"type": "fetch"})
         for env in resp.get("messages", []):
             if env["from"] == peer:
@@ -435,15 +421,19 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     local, store, env["from"], env["payload"], env.get("ts", "")
                 )
 
+        # Pre-establish X3DH session NOW — calls t.rpc() if needed.
+        # Must happen before dispatcher starts to avoid concurrent recv().
+        initial_state = await _ensure_session_sender(t, local, store, peer)
+        # Grab X3DH header if this is a brand-new session (attach to msg #1 only)
+        pending_x3dh: Optional[dict] = getattr(initial_state, "_x3dh_header", None)
+
+        # ── Phase 2: start background tasks ──────────────────────────────────
         ack_q:   asyncio.Queue = asyncio.Queue()
         inbox_q: asyncio.Queue = asyncio.Queue()
         stop = asyncio.Event()
 
         async def _dispatcher() -> None:
-            """
-            The ONE coroutine allowed to call recv().
-            Routes every incoming frame to the correct queue.
-            """
+            """Sole owner of recv(). Routes frames to typed queues."""
             while not stop.is_set():
                 try:
                     frame = await asyncio.wait_for(t.recv(), timeout=1.0)
@@ -457,7 +447,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     break
 
         async def _printer() -> None:
-            """Print incoming messages as they arrive in inbox_q."""
+            """Drain inbox_q, decrypt and display incoming messages."""
             while not stop.is_set():
                 try:
                     frame = await asyncio.wait_for(inbox_q.get(), timeout=0.5)
@@ -476,6 +466,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
         printer    = asyncio.create_task(_printer())
         loop       = asyncio.get_event_loop()
 
+        # ── Phase 3: send loop ────────────────────────────────────────────────
         try:
             while True:
                 print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
@@ -490,17 +481,20 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     break
 
                 try:
-                    state = await _ensure_session_sender(t, local, store, peer)
-                    x3dh_hdr = getattr(state, "_x3dh_header", None)
+                    # Load from SQLite only — zero rpc/recv() calls
+                    state = store.load_session(peer)
+                    if state is None:
+                        print(f"{C.RED}✗ Session lost — restart chat{C.RESET}")
+                        break
 
                     hdr, ct_b64, state = _encrypt_for_wire(state, text)
                     store.save_session(peer, state)
 
                     payload: dict = {"header": hdr, "ciphertext": ct_b64}
-                    if x3dh_hdr:
-                        payload["x3dh_header"] = x3dh_hdr
+                    if pending_x3dh:
+                        payload["x3dh_header"] = pending_x3dh
+                        pending_x3dh = None  # only on very first message
 
-                    # Only send — dispatcher handles the ack via ack_q
                     await t.send({"type": "send", "to": peer, "payload": payload})
                     try:
                         await asyncio.wait_for(ack_q.get(), timeout=3.0)
