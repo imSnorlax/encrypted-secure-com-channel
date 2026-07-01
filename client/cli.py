@@ -343,13 +343,24 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
             while not chat_stop.is_set():
                 try:
                     frame = await asyncio.wait_for(inbox_q.get(), timeout=0.5)
-                    print(f"\r{' ' * 80}\r", end="", flush=True)
-                    _process_envelope(local, store, frame["from"], frame["payload"], frame.get("ts", ""))
-                    print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
+                    # Clear current prompt line
+                    sys.stdout.write(f"\r{' ' * 80}\r")
+                    sys.stdout.flush()
+                    try:
+                        _process_envelope(
+                            local, store,
+                            frame["from"], frame["payload"], frame.get("ts", ""),
+                        )
+                    except Exception as exc:
+                        sys.stdout.write(f"{C.RED}✗ Display error: {exc}{C.RESET}\n")
+                    sys.stdout.flush()
+                    # Reprint prompt
+                    sys.stdout.write(f"{C.CYAN}you › {C.RESET}")
+                    sys.stdout.flush()
                 except asyncio.TimeoutError:
                     pass
                 except Exception:
-                    break
+                    pass  # keep running — never let printer die
 
         # X3DH state — populated only when user sends first message
         pending_x3dh: Optional[dict] = None
