@@ -411,9 +411,14 @@ def chat(ctx, peer: str) -> None:
 
 async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
     """
-    Interactive full-duplex chat:
-      · background coroutine listens for incoming messages (live delivery)
-      · main coroutine reads stdin and sends encrypted messages
+    Interactive full-duplex chat.
+
+    Uses a single dispatcher task as the ONLY coroutine calling recv().
+    All frames are routed via asyncio.Queue to avoid concurrent recv() calls,
+    which the websockets library forbids.
+
+      ack_q   ← server replies to our sends (ok / queued)
+      inbox_q ← pushed 'deliver' messages from other users
     """
     async with Transport(server) as t:
         resp = await t.rpc({"type": "register", "bundle": local.public_bundle()})
@@ -422,7 +427,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
 
         store = SessionStore(local.username)
 
-        # Drain any queued messages first
+        # Drain any queued messages first (safe: no tasks running yet)
         resp = await t.rpc({"type": "fetch"})
         for env in resp.get("messages", []):
             if env["from"] == peer:
@@ -430,35 +435,53 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     local, store, env["from"], env["payload"], env.get("ts", "")
                 )
 
+        ack_q:   asyncio.Queue = asyncio.Queue()
+        inbox_q: asyncio.Queue = asyncio.Queue()
         stop = asyncio.Event()
 
-        async def _incoming_loop() -> None:
-            """Listen for server-pushed 'deliver' messages."""
+        async def _dispatcher() -> None:
+            """
+            The ONE coroutine allowed to call recv().
+            Routes every incoming frame to the correct queue.
+            """
             while not stop.is_set():
                 try:
-                    msg = await asyncio.wait_for(t.recv(), timeout=1.0)
-                    if msg.get("type") == "deliver":
-                        # Clear current input line before printing
-                        print(f"\r{' ' * 80}\r", end="", flush=True)
-                        _process_envelope(
-                            local, store,
-                            msg["from"], msg["payload"], msg.get("ts", ""),
-                        )
-                        print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
+                    frame = await asyncio.wait_for(t.recv(), timeout=1.0)
+                    if frame.get("type") == "deliver":
+                        await inbox_q.put(frame)
+                    else:
+                        await ack_q.put(frame)
                 except asyncio.TimeoutError:
                     pass
                 except Exception:
                     break
 
-        incoming = asyncio.create_task(_incoming_loop())
-        loop = asyncio.get_event_loop()
+        async def _printer() -> None:
+            """Print incoming messages as they arrive in inbox_q."""
+            while not stop.is_set():
+                try:
+                    frame = await asyncio.wait_for(inbox_q.get(), timeout=0.5)
+                    print(f"\r{' ' * 80}\r", end="", flush=True)
+                    _process_envelope(
+                        local, store,
+                        frame["from"], frame["payload"], frame.get("ts", ""),
+                    )
+                    print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    break
+
+        dispatcher = asyncio.create_task(_dispatcher())
+        printer    = asyncio.create_task(_printer())
+        loop       = asyncio.get_event_loop()
 
         try:
             while True:
                 print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
                 line = await loop.run_in_executor(None, sys.stdin.readline)
 
-                if not line:          # EOF
+                if not line:
                     break
                 text = line.rstrip("\n")
                 if not text:
@@ -477,14 +500,13 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     if x3dh_hdr:
                         payload["x3dh_header"] = x3dh_hdr
 
+                    # Only send — dispatcher handles the ack via ack_q
                     await t.send({"type": "send", "to": peer, "payload": payload})
-                    # Consume the server ack without blocking the incoming loop
                     try:
-                        await asyncio.wait_for(t.recv(), timeout=3.0)
+                        await asyncio.wait_for(ack_q.get(), timeout=3.0)
                     except asyncio.TimeoutError:
                         pass
 
-                    # Overwrite the "you › " prompt line with the sent message
                     now = datetime.now(timezone.utc).isoformat()
                     print(
                         f"\033[1A\r{' ' * 80}\r"
@@ -497,7 +519,8 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
             pass
         finally:
             stop.set()
-            incoming.cancel()
+            dispatcher.cancel()
+            printer.cancel()
             store.close()
 
     click.echo(f"\n{C.DIM}Session ended.{C.RESET}")
