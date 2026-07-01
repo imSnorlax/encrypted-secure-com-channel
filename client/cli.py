@@ -247,7 +247,7 @@ def _process_envelope(
     "--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER",
     show_default=True, help="Relay server WebSocket URL",
 )
-@click.option("--user", default=None, help="Username (auto-detected if only one exists)")
+@click.option("--user", default=None, envvar="CHANNEL_USER", help="Username (auto-detected if only one exists, or set CHANNEL_USER)")
 @click.pass_context
 def cli(ctx, server: str, user: Optional[str]) -> None:
     """Channel — end-to-end encrypted CLI messenger."""
