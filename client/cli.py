@@ -3,15 +3,12 @@
 channel — Secure CLI messenger (Signal-style E2E encryption)
 
 Commands:
-  channel register <username>            Register and upload key bundle
-  channel chat <peer>                    Open interactive chat with <peer>
-  channel send <peer> <message>          Send a single message
-  channel fetch                          Fetch queued messages
-  channel sessions                       List open sessions
-  channel whoami                         Show your username
-
-Identity is stored at ~/.channel/<username>/identity.json
-Sessions are stored at ~/.channel/<username>/store.db
+  channel register <username>
+  channel chat <peer>
+  channel send <peer> <message>
+  channel fetch
+  channel sessions
+  channel whoami
 """
 
 import asyncio
@@ -23,7 +20,6 @@ from typing import Optional
 
 import click
 
-# ── path setup ───────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from client.crypto.keys import LocalIdentity, b64_to_pub_x25519, pub_to_b64
@@ -32,25 +28,14 @@ from client.crypto.double_ratchet import RatchetState, encrypt_message, decrypt_
 from client.store import SessionStore
 from client.transport import Transport
 
-
-# ─── Config ──────────────────────────────────────────────────────────────────
-
 DEFAULT_SERVER = "ws://127.0.0.1:8765"
 IDENTITY_DIR   = Path.home() / ".channel"
 
 
-# ─── ANSI colours ────────────────────────────────────────────────────────────
-
 class C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    GREEN   = "\033[92m"
-    CYAN    = "\033[96m"
-    YELLOW  = "\033[93m"
-    RED     = "\033[91m"
-    BLUE    = "\033[94m"
-    GREY    = "\033[90m"
+    RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
+    GREEN = "\033[92m"; CYAN = "\033[96m"; YELLOW = "\033[93m"
+    RED   = "\033[91m"; BLUE = "\033[94m"; GREY  = "\033[90m"
 
 
 def _banner() -> None:
@@ -66,7 +51,7 @@ def _banner() -> None:
 """)
 
 
-# ─── Identity helpers ─────────────────────────────────────────────────────────
+# ─── Identity ─────────────────────────────────────────────────────────────────
 
 def _identity_path(username: str) -> Path:
     return IDENTITY_DIR / username / "identity.json"
@@ -76,20 +61,15 @@ def _load_identity(username: Optional[str] = None) -> LocalIdentity:
     if username:
         path = _identity_path(username)
     else:
-        dirs = (
-            [d for d in IDENTITY_DIR.iterdir() if d.is_dir()]
-            if IDENTITY_DIR.exists() else []
-        )
+        dirs = [d for d in IDENTITY_DIR.iterdir() if d.is_dir()] if IDENTITY_DIR.exists() else []
         if len(dirs) == 1:
             path = dirs[0] / "identity.json"
         elif not dirs:
-            _die("No identity found. Run:  channel register <username>")
+            _die("No identity found. Run: channel register <username>")
         else:
-            names = [d.name for d in dirs]
-            _die(f"Multiple identities: {names}. Pass --user <username>")
-
+            _die(f"Multiple identities: {[d.name for d in dirs]}. Pass --user <name>")
     if not path.exists():
-        _die(f"Identity not found at {path}. Run:  channel register <username>")
+        _die(f"Identity not found. Run: channel register <username>")
     return LocalIdentity.load(path)
 
 
@@ -97,70 +77,48 @@ def _die(msg: str) -> None:
     click.echo(f"{C.RED}✗ {msg}{C.RESET}", err=True)
     raise SystemExit(1)
 
-
-def _ok(msg: str) -> None:
-    click.echo(f"{C.GREEN}✓{C.RESET} {msg}")
-
-
-def _info(msg: str) -> None:
-    click.echo(f"{C.CYAN}·{C.RESET} {msg}")
+def _ok(msg: str)   -> None: click.echo(f"{C.GREEN}✓{C.RESET} {msg}")
+def _info(msg: str) -> None: click.echo(f"{C.CYAN}·{C.RESET} {msg}")
 
 
-# ─── Crypto wire helpers ──────────────────────────────────────────────────────
+# ─── Crypto helpers ───────────────────────────────────────────────────────────
 
 def _encrypt_for_wire(state: RatchetState, plaintext: str):
-    """Returns (header_dict, ciphertext_b64, new_state)."""
-    hdr, ct_bytes, state = encrypt_message(state, plaintext.encode("utf-8"))
-    return hdr, base64.b64encode(ct_bytes).decode(), state
+    hdr, ct, state = encrypt_message(state, plaintext.encode())
+    return hdr, base64.b64encode(ct).decode(), state
 
 
 def _decrypt_from_wire(state: RatchetState, hdr: dict, ct_b64: str):
-    """Returns (plaintext_str, new_state)."""
-    ct = base64.b64decode(ct_b64)
-    pt_bytes, state = decrypt_message(state, hdr, ct)
-    return pt_bytes.decode("utf-8"), state
+    pt, state = decrypt_message(state, hdr, base64.b64decode(ct_b64))
+    return pt.decode(), state
 
 
-# ─── Session establishment ────────────────────────────────────────────────────
+# ─── Session helpers ──────────────────────────────────────────────────────────
 
-async def _ensure_session_sender(
-    transport: Transport,
-    local: LocalIdentity,
-    store: SessionStore,
-    peer: str,
-) -> RatchetState:
+async def _x3dh_initiate(
+    transport: Transport, local: LocalIdentity, store: SessionStore, peer: str
+) -> tuple[RatchetState, dict]:
     """
-    Return existing ratchet session for peer, or perform X3DH to create one.
-    IMPORTANT: calls transport.rpc() if no session exists — must be called
-    before any background recv() tasks are running.
+    Fetch peer bundle, run X3DH, init sender ratchet, save session.
+    Returns (state, x3dh_header_to_attach_to_first_message).
+    Caller must ensure NO dispatcher is running (this calls transport.recv internally).
     """
-    state = store.load_session(peer)
-    if state:
-        return state
-
     resp = await transport.rpc({"type": "get_bundle", "username": peer})
     if resp["type"] == "error":
-        _die(f"Could not get bundle for '{peer}': {resp['msg']}")
-
+        raise RuntimeError(f"User '{peer}' not found on relay. Are they registered?")
     bundle = resp["bundle"]
-    sk, x3dh_header = x3dh_send(local, bundle)
-
-    remote_spk_pub = b64_to_pub_x25519(bundle["spk_pub"])
-    state = RatchetState.init_sender(sk, remote_spk_pub)
-    state._x3dh_header = x3dh_header  # type: ignore[attr-defined]
-
+    sk, x3dh_hdr = x3dh_send(local, bundle)
+    remote_spk = b64_to_pub_x25519(bundle["spk_pub"])
+    state = RatchetState.init_sender(sk, remote_spk)
     store.save_session(peer, state, is_initiator=True)
-    return state
+    return state, x3dh_hdr
 
 
-def _establish_receiver_session(
-    local: LocalIdentity,
-    store: SessionStore,
-    sender: str,
-    x3dh_header: dict,
+def _x3dh_respond(
+    local: LocalIdentity, store: SessionStore, sender: str, x3dh_hdr: dict
 ) -> RatchetState:
-    """Synchronous X3DH responder — safe everywhere."""
-    sk, used_opk = x3dh_receive(local, x3dh_header)
+    """Receive X3DH header, derive shared secret, init receiver ratchet."""
+    sk, used_opk = x3dh_receive(local, x3dh_hdr)
     if used_opk is not None:
         local.save(_identity_path(local.username))
     state = RatchetState.init_receiver(sk, local.spk_priv, local.spk_pub)
@@ -168,110 +126,79 @@ def _establish_receiver_session(
     return state
 
 
-# ─── Message processing ───────────────────────────────────────────────────────
+# ─── Message display ──────────────────────────────────────────────────────────
 
-def _fmt_ts(ts_str: str) -> str:
+def _fmt_ts(ts: str) -> str:
     try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M")
     except Exception:
-        return "??:??"
+        return "--:--"
+
+def _fmt_msg(sender: str, text: str, ts: str, me: bool) -> str:
+    t = f"{C.GREY}[{_fmt_ts(ts)}]{C.RESET}"
+    n = f"{C.BLUE}{C.BOLD}you{C.RESET}" if me else f"{C.GREEN}{C.BOLD}{sender}{C.RESET}"
+    return f"{t} {n}: {text}"
 
 
-def _fmt_msg(sender: str, text: str, ts: str, is_self: bool) -> str:
-    time = f"{C.GREY}[{_fmt_ts(ts)}]{C.RESET}"
-    name = (
-        f"{C.BLUE}{C.BOLD}you{C.RESET}"
-        if is_self
-        else f"{C.GREEN}{C.BOLD}{sender}{C.RESET}"
-    )
-    return f"{time} {name}: {text}"
-
-
-def _process_envelope(
-    local: LocalIdentity,
-    store: SessionStore,
-    sender: str,
-    payload: dict,
-    ts: str,
-) -> None:
-    """Decrypt and print one incoming message. Fully synchronous."""
+def _process_envelope(local, store, sender, payload, ts):
+    """Decrypt and print one incoming message envelope."""
     x3dh_hdr = payload.get("x3dh_header")
-    hdr       = payload["header"]
-    ct_b64    = payload["ciphertext"]
+    hdr, ct_b64 = payload["header"], payload["ciphertext"]
 
     if x3dh_hdr:
-        # Sender initiated X3DH — ALWAYS establish from their header.
-        # This overrides any session we pre-established locally, because
-        # both sides calling _ensure_session_sender at chat startup would
-        # produce two different session keys (different ephemeral keys).
-        # The incoming X3DH header is the authoritative source of truth.
+        # Sender did X3DH — always establish from their header (authoritative)
         try:
-            state = _establish_receiver_session(local, store, sender, x3dh_hdr)
-        except Exception as exc:
-            click.echo(f"{C.RED}✗ X3DH failed from {sender}: {exc}{C.RESET}")
+            state = _x3dh_respond(local, store, sender, x3dh_hdr)
+        except Exception as e:
+            click.echo(f"{C.RED}✗ X3DH failed from {sender}: {e}{C.RESET}")
             return
     else:
         state = store.load_session(sender)
         if state is None:
-            click.echo(f"{C.RED}✗ No session with {sender}. Dropping.{C.RESET}")
+            click.echo(f"{C.RED}✗ No session with {sender} — message dropped.{C.RESET}")
             return
 
     try:
         text, state = _decrypt_from_wire(state, hdr, ct_b64)
         store.save_session(sender, state)
-        click.echo(_fmt_msg(sender, text, ts, is_self=False))
-    except Exception as exc:
-        click.echo(f"{C.RED}✗ Decrypt failed from {sender}: {exc}{C.RESET}")
+        click.echo(_fmt_msg(sender, text, ts, me=False))
+    except Exception as e:
+        click.echo(f"{C.RED}✗ Decrypt failed from {sender}: {e}{C.RESET}")
 
 
-# ─── CLI root ─────────────────────────────────────────────────────────────────
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.option(
-    "--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER",
-    show_default=True, help="Relay server WebSocket URL",
-)
-@click.option(
-    "--user", default=None, envvar="CHANNEL_USER",
-    help="Username (auto-detected if only one exists, or set CHANNEL_USER)",
-)
+@click.option("--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER", show_default=True)
+@click.option("--user",   default=None,           envvar="CHANNEL_USER")
 @click.pass_context
-def cli(ctx, server: str, user: Optional[str]) -> None:
+def cli(ctx, server, user):
     """Channel — end-to-end encrypted CLI messenger."""
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
     ctx.obj["user"]   = user
 
 
-# ─── register ────────────────────────────────────────────────────────────────
-
 @cli.command()
 @click.argument("username")
-@click.option("--opks", default=10, show_default=True,
-              help="Number of one-time prekeys to generate")
+@click.option("--opks", default=10, show_default=True)
 @click.pass_context
-def register(ctx, username: str, opks: int) -> None:
-    """Generate identity keys and register with the relay server."""
+def register(ctx, username, opks):
+    """Generate keys and register with the relay."""
     _banner()
-    server = ctx.obj["server"]
-    path   = _identity_path(username)
-
+    path = _identity_path(username)
     if path.exists():
-        if not click.confirm(
-            f"{C.YELLOW}Identity for '{username}' already exists. Overwrite?{C.RESET}"
-        ):
+        if not click.confirm(f"{C.YELLOW}Overwrite existing identity for '{username}'?{C.RESET}"):
             return
-
     _info(f"Generating identity for {C.BOLD}{username}{C.RESET} …")
     identity = LocalIdentity.generate(username, num_opks=opks)
     identity.save(path)
     _ok(f"Identity saved → {path}")
     _info("Connecting to relay …")
-    asyncio.run(_do_register(server, identity))
+    asyncio.run(_do_register(ctx.obj["server"], identity))
 
 
-async def _do_register(server: str, identity: LocalIdentity) -> None:
+async def _do_register(server, identity):
     async with Transport(server) as t:
         resp = await t.rpc({"type": "register", "bundle": identity.public_bundle()})
     if resp["type"] == "ok":
@@ -281,216 +208,190 @@ async def _do_register(server: str, identity: LocalIdentity) -> None:
         _die(f"Registration failed: {resp.get('msg')}")
 
 
-# ─── whoami ───────────────────────────────────────────────────────────────────
+@cli.command()
+@click.pass_context
+def whoami(ctx):
+    """Show identity info."""
+    i = _load_identity(ctx.obj["user"])
+    click.echo(f"Username  : {C.BOLD}{i.username}{C.RESET}")
+    click.echo(f"IK pub    : {C.DIM}{pub_to_b64(i.ik_pub)[:32]}…{C.RESET}")
+    click.echo(f"Sign pub  : {C.DIM}{pub_to_b64(i.ik_sign_pub)[:32]}…{C.RESET}")
+    click.echo(f"OPKs left : {len(i.opks)}")
+
 
 @cli.command()
 @click.pass_context
-def whoami(ctx) -> None:
-    """Show your identity info."""
-    identity = _load_identity(ctx.obj["user"])
-    click.echo(f"Username  : {C.BOLD}{identity.username}{C.RESET}")
-    click.echo(f"IK pub    : {C.DIM}{pub_to_b64(identity.ik_pub)[:32]}…{C.RESET}")
-    click.echo(f"Sign pub  : {C.DIM}{pub_to_b64(identity.ik_sign_pub)[:32]}…{C.RESET}")
-    click.echo(f"OPKs left : {len(identity.opks)}")
-
-
-# ─── sessions ─────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.pass_context
-def sessions(ctx) -> None:
-    """List peers you have open sessions with."""
-    identity = _load_identity(ctx.obj["user"])
-    store    = SessionStore(identity.username)
-    peers    = store.list_sessions()
-    store.close()
+def sessions(ctx):
+    """List open sessions."""
+    i = _load_identity(ctx.obj["user"])
+    s = SessionStore(i.username)
+    peers = s.list_sessions(); s.close()
     if not peers:
         click.echo(f"{C.DIM}No open sessions.{C.RESET}")
     else:
         click.echo(f"{C.BOLD}Open sessions:{C.RESET}")
-        for p in peers:
-            click.echo(f"  {C.CYAN}·{C.RESET} {p}")
+        for p in peers: click.echo(f"  {C.CYAN}·{C.RESET} {p}")
 
-
-# ─── send ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("peer")
 @click.argument("message")
 @click.pass_context
-def send(ctx, peer: str, message: str) -> None:
-    """Send a single encrypted message to PEER."""
-    identity = _load_identity(ctx.obj["user"])
-    asyncio.run(_do_send(ctx.obj["server"], identity, peer, message))
+def send(ctx, peer, message):
+    """Send a single encrypted message."""
+    asyncio.run(_do_send(ctx.obj["server"], _load_identity(ctx.obj["user"]), peer, message))
 
 
-async def _do_send(
-    server: str, local: LocalIdentity, peer: str, plaintext: str
-) -> None:
+async def _do_send(server, local, peer, plaintext):
     async with Transport(server) as t:
-        resp = await t.rpc({"type": "register", "bundle": local.public_bundle()})
-        if resp["type"] != "ok":
-            _die(f"Server auth failed: {resp}")
-
+        await t.rpc({"type": "register", "bundle": local.public_bundle()})
         store = SessionStore(local.username)
-        state = await _ensure_session_sender(t, local, store, peer)
-        x3dh_hdr = getattr(state, "_x3dh_header", None)
-
+        x3dh_hdr = None
+        if not store.has_session(peer):
+            _, x3dh_hdr = await _x3dh_initiate(t, local, store, peer)
+        state = store.load_session(peer)
         hdr, ct_b64, state = _encrypt_for_wire(state, plaintext)
         store.save_session(peer, state)
-
-        payload: dict = {"header": hdr, "ciphertext": ct_b64}
+        payload = {"header": hdr, "ciphertext": ct_b64}
         if x3dh_hdr:
             payload["x3dh_header"] = x3dh_hdr
-
         resp = await t.rpc({"type": "send", "to": peer, "payload": payload})
         store.close()
+    _ok(f"Message {'delivered' if resp.get('msg') == 'delivered' else 'queued'} → {peer}") \
+        if resp["type"] == "ok" else _die(f"Send failed: {resp}")
 
-    status = "delivered" if resp.get("msg") == "delivered" else "queued"
-    if resp["type"] == "ok":
-        _ok(f"Message {status} → {peer}")
-    else:
-        _die(f"Send failed: {resp}")
-
-
-# ─── fetch ────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.pass_context
-def fetch(ctx) -> None:
+def fetch(ctx):
     """Fetch and decrypt queued messages."""
-    identity = _load_identity(ctx.obj["user"])
-    asyncio.run(_do_fetch(ctx.obj["server"], identity))
+    asyncio.run(_do_fetch(ctx.obj["server"], _load_identity(ctx.obj["user"])))
 
 
-async def _do_fetch(server: str, local: LocalIdentity) -> None:
+async def _do_fetch(server, local):
     async with Transport(server) as t:
-        resp = await t.rpc({"type": "register", "bundle": local.public_bundle()})
-        if resp["type"] != "ok":
-            _die("Server auth failed")
+        await t.rpc({"type": "register", "bundle": local.public_bundle()})
         resp = await t.rpc({"type": "fetch"})
-
     messages = resp.get("messages", [])
     if not messages:
-        _info("No queued messages.")
-        return
-
+        return _info("No queued messages.")
     store = SessionStore(local.username)
     for env in messages:
         _process_envelope(local, store, env["from"], env["payload"], env.get("ts", ""))
     store.close()
 
 
-# ─── chat (interactive) ───────────────────────────────────────────────────────
-
 @cli.command()
 @click.argument("peer")
 @click.pass_context
-def chat(ctx, peer: str) -> None:
-    """Open an interactive real-time chat session with PEER."""
+def chat(ctx, peer):
+    """Open interactive chat with PEER."""
     identity = _load_identity(ctx.obj["user"])
     _banner()
-    click.echo(
-        f"  {C.BOLD}Chatting with {C.GREEN}{peer}{C.RESET}  "
-        f"{C.DIM}(/quit to exit){C.RESET}\n"
-    )
+    click.echo(f"  {C.BOLD}Chatting with {C.GREEN}{peer}{C.RESET}  {C.DIM}(/quit to exit){C.RESET}\n")
     asyncio.run(_do_chat(ctx.obj["server"], identity, peer))
 
 
 async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
     """
-    Interactive full-duplex chat.
+    Full-duplex interactive chat.
 
-    Architecture:
-      - ONE dispatcher task owns all recv() calls (websockets forbids concurrent recv)
-      - All frames routed via asyncio.Queue:
-          ack_q   → server acks for our outgoing sends
-          inbox_q → incoming 'deliver' frames from peer
-      - Session pre-established BEFORE dispatcher starts, so no recv()
-        call is ever made inside the send loop.
+    Design:
+    ─ ONE dispatcher task owns all recv() calls (websockets forbids concurrent recv)
+    ─ Frames routed via asyncio.Queue: ack_q (server acks) / inbox_q (incoming msgs)
+    ─ Session established LAZILY on first send:
+        · dispatcher is cancelled before X3DH rpc() call
+        · restarted immediately after
+      This avoids BOTH the concurrent-recv crash AND the "user not found" error
+      that happened when we tried to fetch a bundle before the peer had registered.
     """
     async with Transport(server) as t:
 
-        # ── Phase 1: sequential setup (no background tasks yet) ──────────────
+        # ── Sequential setup (no background tasks yet) ────────────────────────
         resp = await t.rpc({"type": "register", "bundle": local.public_bundle()})
         if resp["type"] != "ok":
             _die("Server auth failed")
 
         store = SessionStore(local.username)
 
-        # Flush any offline messages
+        # Flush offline messages
         resp = await t.rpc({"type": "fetch"})
         for env in resp.get("messages", []):
             if env["from"] == peer:
-                _process_envelope(
-                    local, store, env["from"], env["payload"], env.get("ts", "")
-                )
+                _process_envelope(local, store, env["from"], env["payload"], env.get("ts", ""))
 
-        # Pre-establish X3DH session NOW — calls t.rpc() if needed.
-        # Must happen before dispatcher starts to avoid concurrent recv().
-        initial_state = await _ensure_session_sender(t, local, store, peer)
-        # Grab X3DH header if this is a brand-new session (attach to msg #1 only)
-        pending_x3dh: Optional[dict] = getattr(initial_state, "_x3dh_header", None)
-
-        # ── Phase 2: start background tasks ──────────────────────────────────
         ack_q:   asyncio.Queue = asyncio.Queue()
         inbox_q: asyncio.Queue = asyncio.Queue()
-        stop = asyncio.Event()
+        chat_stop = asyncio.Event()
 
-        async def _dispatcher() -> None:
-            """Sole owner of recv(). Routes frames to typed queues."""
-            while not stop.is_set():
-                try:
-                    frame = await asyncio.wait_for(t.recv(), timeout=1.0)
-                    if frame.get("type") == "deliver":
-                        await inbox_q.put(frame)
-                    else:
-                        await ack_q.put(frame)
-                except asyncio.TimeoutError:
-                    pass
-                except Exception:
-                    break
+        def _make_dispatcher():
+            async def _dispatcher():
+                while not chat_stop.is_set():
+                    try:
+                        frame = await asyncio.wait_for(t.recv(), timeout=1.0)
+                        if frame.get("type") == "deliver":
+                            await inbox_q.put(frame)
+                        else:
+                            await ack_q.put(frame)
+                    except asyncio.TimeoutError:
+                        pass
+                    except Exception:
+                        break
+            return asyncio.create_task(_dispatcher())
 
-        async def _printer() -> None:
-            """Drain inbox_q, decrypt and display incoming messages."""
-            while not stop.is_set():
+        async def _printer():
+            while not chat_stop.is_set():
                 try:
                     frame = await asyncio.wait_for(inbox_q.get(), timeout=0.5)
                     print(f"\r{' ' * 80}\r", end="", flush=True)
-                    _process_envelope(
-                        local, store,
-                        frame["from"], frame["payload"], frame.get("ts", ""),
-                    )
+                    _process_envelope(local, store, frame["from"], frame["payload"], frame.get("ts", ""))
                     print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
                 except asyncio.TimeoutError:
                     pass
                 except Exception:
                     break
 
-        dispatcher = asyncio.create_task(_dispatcher())
+        # X3DH state — populated only when user sends first message
+        pending_x3dh: Optional[dict] = None
+
+        dispatcher = _make_dispatcher()
         printer    = asyncio.create_task(_printer())
         loop       = asyncio.get_event_loop()
 
-        # ── Phase 3: send loop ────────────────────────────────────────────────
         try:
             while True:
                 print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
                 line = await loop.run_in_executor(None, sys.stdin.readline)
-
-                if not line:
-                    break
+                if not line: break
                 text = line.rstrip("\n")
-                if not text:
-                    continue
-                if text.lower() in ("/quit", "/q", "/exit"):
-                    break
+                if not text: continue
+                if text.lower() in ("/quit", "/q", "/exit"): break
 
                 try:
-                    # Load from SQLite only — zero rpc/recv() calls
+                    # ── Lazy X3DH: only on very first send, no session yet ────
+                    if not store.has_session(peer) and pending_x3dh is None:
+                        # Stop dispatcher so we can safely call rpc (recv)
+                        dispatcher.cancel()
+                        try:
+                            await dispatcher
+                        except asyncio.CancelledError:
+                            pass
+
+                        try:
+                            _, pending_x3dh = await _x3dh_initiate(t, local, store, peer)
+                        except Exception as exc:
+                            print(f"\n{C.RED}✗ {exc}{C.RESET}")
+                            # Restart dispatcher and let user try again
+                            dispatcher = _make_dispatcher()
+                            continue
+
+                        # Restart dispatcher
+                        dispatcher = _make_dispatcher()
+
                     state = store.load_session(peer)
                     if state is None:
-                        print(f"{C.RED}✗ Session lost — restart chat{C.RESET}")
-                        break
+                        print(f"\n{C.RED}✗ No session — try sending again{C.RESET}")
+                        continue
 
                     hdr, ct_b64, state = _encrypt_for_wire(state, text)
                     store.save_session(peer, state)
@@ -498,7 +399,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                     payload: dict = {"header": hdr, "ciphertext": ct_b64}
                     if pending_x3dh:
                         payload["x3dh_header"] = pending_x3dh
-                        pending_x3dh = None  # only on very first message
+                        pending_x3dh = None
 
                     await t.send({"type": "send", "to": peer, "payload": payload})
                     try:
@@ -507,17 +408,15 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                         pass
 
                     now = datetime.now(timezone.utc).isoformat()
-                    print(
-                        f"\033[1A\r{' ' * 80}\r"
-                        f"{_fmt_msg(local.username, text, now, is_self=True)}"
-                    )
+                    print(f"\033[1A\r{' ' * 80}\r{_fmt_msg(local.username, text, now, me=True)}")
+
                 except Exception as exc:
                     print(f"\n{C.RED}✗ Send error: {exc}{C.RESET}")
 
         except KeyboardInterrupt:
             pass
         finally:
-            stop.set()
+            chat_stop.set()
             dispatcher.cancel()
             printer.cancel()
             store.close()
