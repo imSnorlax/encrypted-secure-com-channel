@@ -3,7 +3,7 @@
 channel — Secure CLI messenger (Signal-style E2E encryption)
 
 Commands:
-  channel register <username>
+  channel register [USERNAME]        (prompts if not given)
   channel chat <peer>
   channel send <peer> <message>
   channel fetch
@@ -32,59 +32,113 @@ DEFAULT_SERVER = "ws://127.0.0.1:8765"
 IDENTITY_DIR   = Path.home() / ".channel"
 
 
-class C:
-    RESET   = "\033[0m";  BOLD    = "\033[1m";  DIM    = "\033[2m"
-    GREEN   = "\033[92m"; CYAN    = "\033[96m"; YELLOW = "\033[93m"
-    RED     = "\033[91m"; BLUE    = "\033[94m"; GREY   = "\033[90m"
-    MAGENTA = "\033[95m"; WHITE   = "\033[97m"; BG_DARK = "\033[40m"
+# ─── ANSI colour helpers ──────────────────────────────────────────────────────
 
+class C:
+    RESET   = "\033[0m";  BOLD    = "\033[1m";  DIM     = "\033[2m"
+    GREEN   = "\033[92m"; CYAN    = "\033[96m"; YELLOW  = "\033[93m"
+    RED     = "\033[91m"; BLUE    = "\033[94m"; GREY    = "\033[90m"
+    MAGENTA = "\033[95m"; WHITE   = "\033[97m"; BG_DARK = "\033[40m"
+    PURPLE  = "\033[35m"
+
+
+def _strip_ansi(s: str) -> str:
+    """Return the printable length of a string, ignoring ANSI escapes."""
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+def _visible_len(s: str) -> int:
+    return len(_strip_ansi(s))
+
+
+def _padded(label: str, value: str, total_label_width: int = 10) -> str:
+    """Print a key-value row with aligned columns."""
+    pad = " " * (total_label_width - _visible_len(label))
+    return f"  {C.BOLD}{label}{C.RESET}{pad}{value}"
+
+
+# ─── Banner ───────────────────────────────────────────────────────────────────
 
 def _banner() -> None:
     print(f"""
-{C.CYAN}{C.BOLD}  ███████╗███╗   ██╗ ██████╗ ██████╗ ██╗     ██╗  ██╗██╗  ██╗██╗
-  ██╔════╝████╗  ██║██╔═████╗██╔══██╗██║     ██║  ██║╚██╗██╔╝██║
-  ███████╗██╔██╗ ██║██║██╔██║██████╔╝██║     ███████║ ╚███╔╝ ██║
-  ╚════██║██║╚██╗██║████╔╝██║██╔══██╗██║     ╚════██║ ██╔██╗ ╚═╝
-  ███████║██║ ╚████║╚██████╔╝██║  ██║███████╗     ██║██╔╝ ██╗██╗
-  ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝     ╚═╝╚═╝  ╚═╝╚═╝{C.RESET}
-{C.GREY}  ┌─────────────────────────────────────────────────────────┐
-  │  {C.CYAN}Protocol{C.GREY}  X3DH + Double Ratchet   {C.CYAN}Cipher{C.GREY}  AES-256-GCM  │
-  │  {C.CYAN}Keys{C.GREY}     X25519 · Ed25519        {C.CYAN}KDF{C.GREY}    HKDF-SHA256  │
-  └─────────────────────────────────────────────────────────┘{C.RESET}
+{C.CYAN}{C.BOLD}  ██████╗██╗  ██╗ █████╗ ███╗   ██╗███╗   ██╗███████╗██╗
+ ██╔════╝██║  ██║██╔══██╗████╗  ██║████╗  ██║██╔════╝██║
+ ██║     ███████║███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+ ██║     ██╔══██║██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+ ╚██████╗██║  ██║██║  ██║██║ ╚████║██║ ╚████║███████╗███████╗
+  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝{C.RESET}
+{C.GREY}  ┌────────────────────────────────────────────────────────────┐
+  │  {C.CYAN}Protocol{C.GREY}  X3DH + Double Ratchet    {C.CYAN}Cipher{C.GREY}  AES-256-GCM   │
+  │  {C.CYAN}Keys{C.GREY}     X25519 · Ed25519         {C.CYAN}KDF{C.GREY}    HKDF-SHA256   │
+  └────────────────────────────────────────────────────────────┘{C.RESET}
 """)
 
 
-# ─── Identity ─────────────────────────────────────────────────────────────────
+# ─── Box helpers ──────────────────────────────────────────────────────────────
+
+def _box(lines: list[str], colour: str = C.GREY) -> None:
+    """
+    Print a neat box whose width fits the longest line.
+    Lines may contain ANSI codes — width is measured on printable chars.
+    """
+    inner_width = max(_visible_len(l) for l in lines) + 2  # 1-space padding each side
+    top    = f"  {colour}┌{'─' * inner_width}┐{C.RESET}"
+    bottom = f"  {colour}└{'─' * inner_width}┘{C.RESET}"
+    print(top)
+    for line in lines:
+        vis = _visible_len(line)
+        right_pad = " " * (inner_width - vis - 1)
+        print(f"  {colour}│{C.RESET} {line}{right_pad} {colour}│{C.RESET}")
+    print(bottom)
+
+
+def _divider(width: int = 57) -> None:
+    click.echo(f"  {C.GREY}{'─' * width}{C.RESET}")
+
+
+# ─── Message helpers ──────────────────────────────────────────────────────────
+
+def _die(msg: str) -> None:
+    click.echo(f"\n  {C.RED}✗  {msg}{C.RESET}\n", err=True)
+    raise SystemExit(1)
+
+def _ok(msg: str)   -> None: click.echo(f"  {C.GREEN}✓{C.RESET}  {msg}")
+def _info(msg: str) -> None: click.echo(f"  {C.CYAN}»{C.RESET}  {msg}")
+def _warn(msg: str) -> None: click.echo(f"  {C.YELLOW}⚠{C.RESET}  {msg}")
+
+
+# ─── Identity helpers ─────────────────────────────────────────────────────────
 
 def _identity_path(username: str) -> Path:
     return IDENTITY_DIR / username / "identity.json"
 
 
+def _list_identities() -> list[str]:
+    if not IDENTITY_DIR.exists():
+        return []
+    return [d.name for d in sorted(IDENTITY_DIR.iterdir()) if d.is_dir()
+            and (d / "identity.json").exists()]
+
+
 def _load_identity(username: Optional[str] = None) -> LocalIdentity:
     if username:
         path = _identity_path(username)
+        if not path.exists():
+            _die(f"No identity for '{username}'.  Run: channel register {username}")
+        return LocalIdentity.load(path)
+
+    # Auto-discover
+    names = _list_identities()
+    if len(names) == 1:
+        return LocalIdentity.load(_identity_path(names[0]))
+    elif not names:
+        _die("No identity found.  Run: channel register <username>")
     else:
-        dirs = [d for d in IDENTITY_DIR.iterdir() if d.is_dir()] if IDENTITY_DIR.exists() else []
-        if len(dirs) == 1:
-            path = dirs[0] / "identity.json"
-        elif not dirs:
-            _die("No identity found. Run: channel register <username>")
-        else:
-            _die(f"Multiple identities: {[d.name for d in dirs]}. Pass --user <name>")
-    if not path.exists():
-        _die(f"Identity not found. Run: channel register <username>")
-    return LocalIdentity.load(path)
-
-
-def _die(msg: str) -> None:
-    click.echo(f"{C.RED}✗ {msg}{C.RESET}", err=True)
-    raise SystemExit(1)
-
-def _ok(msg: str)   -> None: click.echo(f"  {C.GREEN}✓{C.RESET}  {msg}")
-def _info(msg: str) -> None: click.echo(f"  {C.CYAN}»{C.RESET}  {msg}")
-def _warn(msg: str) -> None: click.echo(f"  {C.YELLOW}!{C.RESET}  {msg}")
-def _divider()      -> None: click.echo(f"  {C.GREY}{'─' * 55}{C.RESET}")
-
+        _die(
+            f"Multiple identities found: {names}\n"
+            f"     Pass --user <name> or set CHANNEL_USER=<name>"
+        )
 
 
 # ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -111,7 +165,7 @@ async def _x3dh_initiate(
     """
     resp = await transport.rpc({"type": "get_bundle", "username": peer})
     if resp["type"] == "error":
-        raise RuntimeError(f"User '{peer}' not found on relay. Are they registered?")
+        raise RuntimeError(f"User '{peer}' not found on relay — are they registered?")
     bundle = resp["bundle"]
     sk, x3dh_hdr = x3dh_send(local, bundle)
     remote_spk = b64_to_pub_x25519(bundle["spk_pub"])
@@ -140,9 +194,13 @@ def _fmt_ts(ts: str) -> str:
     except Exception:
         return "--:--"
 
+
 def _fmt_msg(sender: str, text: str, ts: str, me: bool) -> str:
     t = f"{C.GREY}[{_fmt_ts(ts)}]{C.RESET}"
-    n = f"{C.BLUE}{C.BOLD}you{C.RESET}" if me else f"{C.GREEN}{C.BOLD}{sender}{C.RESET}"
+    if me:
+        n = f"{C.BLUE}{C.BOLD}you{C.RESET}"
+    else:
+        n = f"{C.GREEN}{C.BOLD}{sender}{C.RESET}"
     return f"{t} {n}: {text}"
 
 
@@ -152,16 +210,15 @@ def _process_envelope(local, store, sender, payload, ts):
     hdr, ct_b64 = payload["header"], payload["ciphertext"]
 
     if x3dh_hdr:
-        # Sender did X3DH — always establish from their header (authoritative)
         try:
             state = _x3dh_respond(local, store, sender, x3dh_hdr)
         except Exception as e:
-            click.echo(f"{C.RED}✗ X3DH failed from {sender}: {e}{C.RESET}")
+            click.echo(f"  {C.RED}✗  X3DH failed from {sender}: {e}{C.RESET}")
             return
     else:
         state = store.load_session(sender)
         if state is None:
-            click.echo(f"{C.RED}✗ No session with {sender} — message dropped.{C.RESET}")
+            click.echo(f"  {C.RED}✗  No session with {sender} — message dropped.{C.RESET}")
             return
 
     try:
@@ -169,14 +226,16 @@ def _process_envelope(local, store, sender, payload, ts):
         store.save_session(sender, state)
         click.echo(_fmt_msg(sender, text, ts, me=False))
     except Exception as e:
-        click.echo(f"{C.RED}✗ Decrypt failed from {sender}: {e}{C.RESET}")
+        click.echo(f"  {C.RED}✗  Decrypt failed from {sender}: {e}{C.RESET}")
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ─── CLI group ────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.option("--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER", show_default=True)
-@click.option("--user",   default=None,           envvar="CHANNEL_USER")
+@click.option("--server", default=DEFAULT_SERVER, envvar="CHANNEL_SERVER", show_default=True,
+              help="Relay server WebSocket URL.")
+@click.option("--user",   default=None,           envvar="CHANNEL_USER",
+              help="Local username to use (required when multiple identities exist).")
 @click.pass_context
 def cli(ctx, server, user):
     """Channel — end-to-end encrypted CLI messenger."""
@@ -185,73 +244,135 @@ def cli(ctx, server, user):
     ctx.obj["user"]   = user
 
 
+# ─── register ─────────────────────────────────────────────────────────────────
+
 @cli.command()
-@click.argument("username")
-@click.option("--opks", default=10, show_default=True)
+@click.argument("username", required=False, default=None)
+@click.option("--opks", default=10, show_default=True,
+              help="Number of one-time prekeys to generate.")
 @click.pass_context
-def register(ctx, username, opks):
-    """Generate keys and register with the relay."""
+def register(ctx, username: Optional[str], opks: int):
+    """Generate keys and register with the relay.
+
+    USERNAME is optional — you will be prompted if not provided.
+    """
     _banner()
+
+    # ── Interactive username prompt ────────────────────────────────────────────
+    if not username:
+        existing = _list_identities()
+        if existing:
+            _info(f"Existing identities: {C.CYAN}{', '.join(existing)}{C.RESET}")
+        print()
+        while True:
+            username = click.prompt(
+                f"  {C.BOLD}Choose a username{C.RESET}", prompt_suffix=" › "
+            ).strip()
+            if not username:
+                _warn("Username cannot be empty.")
+                continue
+            if " " in username:
+                _warn("Username cannot contain spaces.")
+                continue
+            if len(username) > 32:
+                _warn("Username must be 32 characters or fewer.")
+                continue
+            break
+        print()
+
+    # ── Confirm overwrite if identity already exists ───────────────────────────
     path = _identity_path(username)
     if path.exists():
-        if not click.confirm(f"{C.YELLOW}Overwrite existing identity for '{username}'?{C.RESET}"):
+        _warn(f"An identity for '{username}' already exists locally.")
+        if not click.confirm(f"  {C.YELLOW}Overwrite?{C.RESET}", default=False):
+            _info("Cancelled.")
             return
+        print()
+
+    # ── Generate & save ───────────────────────────────────────────────────────
     _info(f"Generating identity for {C.BOLD}{C.CYAN}{username}{C.RESET} …")
     identity = LocalIdentity.generate(username, num_opks=opks)
     identity.save(path)
-    _ok(f"Identity saved  {C.DIM}{path}{C.RESET}")
-    _info(f"Uploading key bundle to relay …")
+    _ok(f"Keys saved  {C.DIM}{path}{C.RESET}")
+
+    # ── Upload ────────────────────────────────────────────────────────────────
+    _info("Uploading key bundle to relay …")
     asyncio.run(_do_register(ctx.obj["server"], identity))
 
 
-async def _do_register(server, identity):
+async def _do_register(server: str, identity) -> None:
     async with Transport(server) as t:
         resp = await t.rpc({"type": "register", "bundle": identity.public_bundle()})
+    print()
     if resp["type"] == "ok":
-        _ok(f"Registered as {C.BOLD}{C.CYAN}{identity.username}{C.RESET}")
-        _ok(f"Uploaded {C.BOLD}{len(identity.opks)}{C.RESET} one-time prekeys  {C.DIM}(forward secrecy){C.RESET}")
-        _divider()
+        _box([
+            f"{C.GREEN}{C.BOLD}Registration successful!{C.RESET}",
+            "",
+            f"{C.BOLD}Username{C.RESET}  {C.CYAN}{identity.username}{C.RESET}",
+            f"{C.BOLD}OPKs{C.RESET}      {len(identity.opks)} one-time prekeys uploaded  {C.DIM}(forward secrecy){C.RESET}",
+            "",
+            f"{C.DIM}You can now start a chat:{C.RESET}",
+            f"  {C.CYAN}channel chat <peer>{C.RESET}",
+        ])
     else:
         _die(f"Registration failed: {resp.get('msg')}")
+    print()
 
+
+# ─── whoami ───────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.pass_context
 def whoami(ctx):
-    """Show identity info."""
+    """Show your identity info."""
     i = _load_identity(ctx.obj["user"])
-    _divider()
-    click.echo(f"  {C.BOLD}Username {C.RESET}  {C.CYAN}{i.username}{C.RESET}")
-    click.echo(f"  {C.BOLD}IK pub   {C.RESET}  {C.DIM}{pub_to_b64(i.ik_pub)[:40]}…{C.RESET}")
-    click.echo(f"  {C.BOLD}Sign pub {C.RESET}  {C.DIM}{pub_to_b64(i.ik_sign_pub)[:40]}…{C.RESET}")
-    click.echo(f"  {C.BOLD}OPKs     {C.RESET}  {len(i.opks)} remaining")
-    _divider()
+    print()
+    _box([
+        f"{C.CYAN}{C.BOLD}Identity: {i.username}{C.RESET}",
+        "",
+        f"{C.BOLD}IK pub{C.RESET}   {C.DIM}{pub_to_b64(i.ik_pub)[:44]}…{C.RESET}",
+        f"{C.BOLD}Sign pub{C.RESET} {C.DIM}{pub_to_b64(i.ik_sign_pub)[:44]}…{C.RESET}",
+        f"{C.BOLD}OPKs{C.RESET}     {C.YELLOW}{len(i.opks)}{C.RESET} remaining",
+    ])
+    print()
 
+
+# ─── sessions ─────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.pass_context
 def sessions(ctx):
-    """List open sessions."""
+    """List open E2E sessions."""
     i = _load_identity(ctx.obj["user"])
     s = SessionStore(i.username)
-    peers = s.list_sessions(); s.close()
+    peers = s.list_sessions()
+    s.close()
+    print()
     if not peers:
-        click.echo(f"{C.DIM}No open sessions.{C.RESET}")
+        _box([
+            f"{C.DIM}No open sessions yet.{C.RESET}",
+            f"{C.DIM}Start one with:  channel chat <peer>{C.RESET}",
+        ])
     else:
-        click.echo(f"{C.BOLD}Open sessions:{C.RESET}")
-        for p in peers: click.echo(f"  {C.CYAN}·{C.RESET} {p}")
+        lines = [f"{C.CYAN}{C.BOLD}Open sessions for {i.username}{C.RESET}", ""]
+        for idx, p in enumerate(peers, 1):
+            lines.append(f"  {C.GREY}{idx}.{C.RESET}  {C.GREEN}{p}{C.RESET}")
+        _box(lines)
+    print()
 
+
+# ─── send ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("peer")
 @click.argument("message")
 @click.pass_context
 def send(ctx, peer, message):
-    """Send a single encrypted message."""
+    """Send a single encrypted message to PEER."""
     asyncio.run(_do_send(ctx.obj["server"], _load_identity(ctx.obj["user"]), peer, message))
 
 
-async def _do_send(server, local, peer, plaintext):
+async def _do_send(server: str, local, peer: str, plaintext: str) -> None:
     async with Transport(server) as t:
         await t.rpc({"type": "register", "bundle": local.public_bundle()})
         store = SessionStore(local.username)
@@ -266,9 +387,14 @@ async def _do_send(server, local, peer, plaintext):
             payload["x3dh_header"] = x3dh_hdr
         resp = await t.rpc({"type": "send", "to": peer, "payload": payload})
         store.close()
-    _ok(f"Message {'delivered' if resp.get('msg') == 'delivered' else 'queued'} → {peer}") \
-        if resp["type"] == "ok" else _die(f"Send failed: {resp}")
+    status = "delivered" if resp.get("msg") == "delivered" else "queued"
+    if resp["type"] == "ok":
+        _ok(f"Message {C.GREEN}{status}{C.RESET} → {C.CYAN}{peer}{C.RESET}")
+    else:
+        _die(f"Send failed: {resp}")
 
+
+# ─── fetch ────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.pass_context
@@ -277,33 +403,58 @@ def fetch(ctx):
     asyncio.run(_do_fetch(ctx.obj["server"], _load_identity(ctx.obj["user"])))
 
 
-async def _do_fetch(server, local):
+async def _do_fetch(server: str, local) -> None:
     async with Transport(server) as t:
         await t.rpc({"type": "register", "bundle": local.public_bundle()})
         resp = await t.rpc({"type": "fetch"})
     messages = resp.get("messages", [])
     if not messages:
         return _info("No queued messages.")
+    _info(f"Decrypting {len(messages)} message(s) …")
+    _divider()
     store = SessionStore(local.username)
     for env in messages:
         _process_envelope(local, store, env["from"], env["payload"], env.get("ts", ""))
     store.close()
+    _divider()
 
+
+# ─── chat ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("peer")
 @click.pass_context
 def chat(ctx, peer):
-    """Open interactive chat with PEER."""
+    """Open interactive end-to-end encrypted chat with PEER."""
     identity = _load_identity(ctx.obj["user"])
     _banner()
-    click.echo(
-        f"  {C.GREY}┌──────────────────────────────────────────┐{C.RESET}\n"
-        f"  {C.GREY}│{C.RESET}  Chatting with {C.GREEN}{C.BOLD}{peer}{C.RESET}          "
-        f"{C.DIM}/quit to exit{C.RESET}  {C.GREY}│{C.RESET}\n"
-        f"  {C.GREY}│{C.RESET}  {C.DIM}End-to-end encrypted · relay sees nothing{C.RESET}  {C.GREY}│{C.RESET}\n"
-        f"  {C.GREY}└──────────────────────────────────────────┘{C.RESET}\n"
-    )
+
+    # Dynamic-width chat header
+    me = identity.username
+    subtitle = "End-to-end encrypted · relay sees nothing"
+    hint     = "/quit to exit"
+    title    = f"  {me}  →  {peer}  "
+    # Measure visible widths and pick the widest
+    widest = max(_visible_len(title), _visible_len(subtitle) + 4, _visible_len(hint) + 4)
+
+    def _pad_centre(text: str, width: int) -> str:
+        vis = _visible_len(text)
+        left  = (width - vis) // 2
+        right = width - vis - left
+        return " " * left + text + " " * right
+
+    title_col    = f"{C.CYAN}{C.BOLD}{me}{C.RESET}  →  {C.GREEN}{C.BOLD}{peer}{C.RESET}"
+    subtitle_col = f"{C.DIM}{subtitle}{C.RESET}"
+    hint_col     = f"{C.DIM}{hint}{C.RESET}"
+
+    _box([
+        _pad_centre(title_col,    widest),
+        _pad_centre(subtitle_col, widest),
+        "",
+        _pad_centre(hint_col,     widest),
+    ])
+    print()
+
     asyncio.run(_do_chat(ctx.obj["server"], identity, peer))
 
 
@@ -320,6 +471,8 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
       This avoids BOTH the concurrent-recv crash AND the "user not found" error
       that happened when we tried to fetch a bundle before the peer had registered.
     """
+    me = local.username
+
     async with Transport(server) as t:
 
         # ── Sequential setup (no background tasks yet) ────────────────────────
@@ -327,13 +480,16 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
         if resp["type"] != "ok":
             _die("Server auth failed")
 
-        store = SessionStore(local.username)
+        store = SessionStore(me)
 
-        # Flush offline messages
+        # Flush offline messages from this peer
         resp = await t.rpc({"type": "fetch"})
-        for env in resp.get("messages", []):
-            if env["from"] == peer:
+        offline = [e for e in resp.get("messages", []) if e["from"] == peer]
+        if offline:
+            _info(f"{len(offline)} offline message(s) from {C.CYAN}{peer}{C.RESET}:")
+            for env in offline:
                 _process_envelope(local, store, env["from"], env["payload"], env.get("ts", ""))
+            _divider()
 
         ack_q:   asyncio.Queue = asyncio.Queue()
         inbox_q: asyncio.Queue = asyncio.Queue()
@@ -354,11 +510,13 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                         break
             return asyncio.create_task(_dispatcher())
 
+        prompt_str = f"{C.CYAN}{me} › {C.RESET}"
+
         async def _printer():
             while not chat_stop.is_set():
                 try:
                     frame = await asyncio.wait_for(inbox_q.get(), timeout=0.5)
-                    # Clear current prompt line
+                    # Clear current prompt line before printing
                     sys.stdout.write(f"\r{' ' * 80}\r")
                     sys.stdout.flush()
                     try:
@@ -367,10 +525,10 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                             frame["from"], frame["payload"], frame.get("ts", ""),
                         )
                     except Exception as exc:
-                        sys.stdout.write(f"{C.RED}✗ Display error: {exc}{C.RESET}\n")
+                        sys.stdout.write(f"  {C.RED}✗  Display error: {exc}{C.RESET}\n")
                     sys.stdout.flush()
                     # Reprint prompt
-                    sys.stdout.write(f"{C.CYAN}you › {C.RESET}")
+                    sys.stdout.write(prompt_str)
                     sys.stdout.flush()
                 except asyncio.TimeoutError:
                     pass
@@ -386,15 +544,32 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
 
         try:
             while True:
-                print(f"{C.CYAN}you › {C.RESET}", end="", flush=True)
+                print(prompt_str, end="", flush=True)
                 line = await loop.run_in_executor(None, sys.stdin.readline)
-                if not line: break
+                if not line:
+                    break
                 text = line.rstrip("\n")
-                if not text: continue
-                if text.lower() in ("/quit", "/q", "/exit"): break
+                if not text:
+                    continue
+                if text.lower() in ("/quit", "/q", "/exit"):
+                    break
+
+                # ── Special commands ──────────────────────────────────────────
+                if text.lower() == "/whoami":
+                    print(f"\r{' ' * 80}\r  {C.CYAN}You are:{C.RESET} {C.BOLD}{me}{C.RESET}")
+                    continue
+                if text.lower() == "/help":
+                    print(
+                        f"\r{' ' * 80}\r"
+                        f"  {C.GREY}Commands:{C.RESET}\n"
+                        f"  {C.CYAN}/quit{C.RESET}    — exit chat\n"
+                        f"  {C.CYAN}/whoami{C.RESET}  — show your username\n"
+                        f"  {C.CYAN}/help{C.RESET}    — this message\n"
+                    )
+                    continue
 
                 try:
-                    # ── Lazy X3DH: only on very first send, no session yet ────
+                    # ── Lazy X3DH: only on very first send ───────────────────
                     if not store.has_session(peer) and pending_x3dh is None:
                         # Stop dispatcher so we can safely call rpc (recv)
                         dispatcher.cancel()
@@ -406,7 +581,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                         try:
                             _, pending_x3dh = await _x3dh_initiate(t, local, store, peer)
                         except Exception as exc:
-                            print(f"\n{C.RED}✗ {exc}{C.RESET}")
+                            print(f"\n  {C.RED}✗  {exc}{C.RESET}")
                             # Restart dispatcher and let user try again
                             dispatcher = _make_dispatcher()
                             continue
@@ -416,7 +591,7 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
 
                     state = store.load_session(peer)
                     if state is None:
-                        print(f"\n{C.RED}✗ No session — try sending again{C.RESET}")
+                        print(f"\n  {C.RED}✗  No session — try sending again{C.RESET}")
                         continue
 
                     hdr, ct_b64, state = _encrypt_for_wire(state, text)
@@ -434,10 +609,11 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
                         pass
 
                     now = datetime.now(timezone.utc).isoformat()
-                    print(f"\033[1A\r{' ' * 80}\r{_fmt_msg(local.username, text, now, me=True)}")
+                    # Overwrite the input line with the formatted sent message
+                    print(f"\033[1A\r{' ' * 80}\r{_fmt_msg(me, text, now, me=True)}")
 
                 except Exception as exc:
-                    print(f"\n{C.RED}✗ Send error: {exc}{C.RESET}")
+                    print(f"\n  {C.RED}✗  Send error: {exc}{C.RESET}")
 
         except KeyboardInterrupt:
             pass
@@ -447,7 +623,12 @@ async def _do_chat(server: str, local: LocalIdentity, peer: str) -> None:
             printer.cancel()
             store.close()
 
-    click.echo(f"\n{C.DIM}Session ended.{C.RESET}")
+    print()
+    _box([
+        f"{C.DIM}Session ended.{C.RESET}",
+        f"{C.DIM}Your messages are gone from this relay — E2E by design.{C.RESET}",
+    ])
+    print()
 
 
 if __name__ == "__main__":
