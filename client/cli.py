@@ -30,6 +30,7 @@ from client.transport import Transport
 
 DEFAULT_SERVER = "ws://127.0.0.1:8765"
 IDENTITY_DIR   = Path.home() / ".channel"
+CONFIG_FILE    = IDENTITY_DIR / "config.json"
 
 
 # ─── ANSI colour helpers ──────────────────────────────────────────────────────
@@ -121,14 +122,44 @@ def _list_identities() -> list[str]:
             and (d / "identity.json").exists()]
 
 
+def _read_active_user() -> Optional[str]:
+    """Return the last-active username saved in ~/.channel/config.json, or None."""
+    try:
+        import json as _json
+        return _json.loads(CONFIG_FILE.read_text()).get("active_user")
+    except Exception:
+        return None
+
+
+def _write_active_user(username: str) -> None:
+    """Persist the given username as the active user in ~/.channel/config.json."""
+    import json as _json
+    IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    try:
+        existing = _json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    existing["active_user"] = username
+    CONFIG_FILE.write_text(_json.dumps(existing, indent=2))
+
+
 def _load_identity(username: Optional[str] = None) -> LocalIdentity:
+    # Explicit flag / env var always wins
     if username:
         path = _identity_path(username)
         if not path.exists():
             _die(f"No identity for '{username}'.  Run: channel register {username}")
         return LocalIdentity.load(path)
 
-    # Auto-discover
+    # Try the saved active user next (set automatically after register)
+    saved = _read_active_user()
+    if saved:
+        path = _identity_path(saved)
+        if path.exists():
+            return LocalIdentity.load(path)
+
+    # Fall back to auto-discover
     names = _list_identities()
     if len(names) == 1:
         return LocalIdentity.load(_identity_path(names[0]))
@@ -295,6 +326,10 @@ def register(ctx, username: Optional[str], opks: int):
     identity.save(path)
     _ok(f"Keys saved  {C.DIM}{path}{C.RESET}")
 
+    # ── Persist as active user ────────────────────────────────────────────────
+    _write_active_user(username)
+    _ok(f"Active user set to {C.CYAN}{C.BOLD}{username}{C.RESET}")
+
     # ── Upload ────────────────────────────────────────────────────────────────
     _info("Uploading key bundle to relay …")
     asyncio.run(_do_register(ctx.obj["server"], identity))
@@ -311,7 +346,12 @@ async def _do_register(server: str, identity) -> None:
             f"{C.BOLD}Username{C.RESET}  {C.CYAN}{identity.username}{C.RESET}",
             f"{C.BOLD}OPKs{C.RESET}      {len(identity.opks)} one-time prekeys uploaded  {C.DIM}(forward secrecy){C.RESET}",
             "",
-            f"{C.DIM}You can now start a chat:{C.RESET}",
+            f"{C.DIM}Active user is now set to {C.RESET}{C.CYAN}{C.BOLD}{identity.username}{C.RESET}{C.DIM} automatically.{C.RESET}",
+            f"{C.DIM}To switch users later:{C.RESET}",
+            f"  {C.CYAN}channel --user <name> chat <peer>{C.RESET}",
+            f"  {C.CYAN}channel register <other-name>{C.RESET}  {C.DIM}(switches active user){C.RESET}",
+            "",
+            f"{C.DIM}Start a chat:{C.RESET}",
             f"  {C.CYAN}channel chat <peer>{C.RESET}",
         ])
     else:
